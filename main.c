@@ -117,7 +117,96 @@ static ble_uuid_t m_adv_uuids[]          =                                      
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
 };
 
+typedef enum
+{
+	SEND_DISABLE, 			//初始化的状态，不执行,或断开连接时设定
+	SEND_DONE,				//wait_tick_cnt = 0; 状态更改为SEND_ENABLE,它在ble的串口接收发送数据蓝牙后触发
+	SEND_ENABLE,			//wait_tick_cnt = 0;通过串口向stm32发送"ok\n",然后状态更改为SEND_OUT_WAIT_RETURN，它由首次连上蓝牙后触发。
+	SEND_OUT_WAIT_RETURN,	//wait_tick_cnt++,当达到第一次触发值时，发送“ok\n"一次，以防丢失！达第二次时，再发送一次"ok\n"，达到第三次时，状态设为SEND_FAIL
+	SEND_FAIL,				//进入到此，说明发送已失败，检测若蓝牙还在连接，则每二秒钟再发送一次”OK\n“，若蓝牙没连接，则将状态设为SEND_DISABLE;
+}SEND_STATUS_t;	
 
+typedef struct
+{
+	uint32_t wait_tick_cnt; //发送“ok\n"后，若接收延时，用此计数，可以再2次允许
+	SEND_STATUS_t status;	//状态控制
+}rx_ctr_t;
+
+#define uart_tx_okn() 												\
+				do                   								\
+				{													\
+					while (app_uart_put('o') == NRF_ERROR_BUSY);	\
+					while (app_uart_put('k') == NRF_ERROR_BUSY);	\
+					while (app_uart_put('\n') == NRF_ERROR_BUSY);	\
+				}while(0)
+				
+static rx_ctr_t mRx_ctr = { .wait_tick_cnt = 0, .status = SEND_DISABLE }; 
+#define UART_RX_CTR_INTERVAL         APP_TIMER_TICKS(30)                   /**< Uart rx controller interval (ticks). */
+APP_TIMER_DEF(m_uart_rx_ctr_timer_id);                                  /**< uart_rx_ctr timer. */
+void uart_ctr_update(rx_ctr_t *ctr)
+{
+	switch(ctr->status)
+	{
+		case SEND_DISABLE:
+		break;
+		
+		case SEND_DONE:
+		case SEND_ENABLE:
+			ctr->wait_tick_cnt = 0;
+			ctr->status = SEND_OUT_WAIT_RETURN;
+		break;
+		
+		case SEND_OUT_WAIT_RETURN:
+			ctr->wait_tick_cnt++;
+			if(ctr->wait_tick_cnt == 3)
+			{
+				uart_tx_okn();
+			}
+			else if(ctr->wait_tick_cnt == 6)
+			{
+				uart_tx_okn();
+			}
+			else if(ctr->wait_tick_cnt >= 7)
+			{
+				ctr->status = SEND_FAIL;
+				ctr->wait_tick_cnt = 0;
+			}
+		break;
+		
+		case SEND_FAIL:
+			if( m_conn_handle != BLE_CONN_HANDLE_INVALID)
+			{
+				ctr->wait_tick_cnt++;
+				if(ctr->wait_tick_cnt == 60 )
+				{
+					ctr->wait_tick_cnt = 0;
+					uart_tx_okn();
+				}
+				
+			}
+			else
+			{
+				ctr->wait_tick_cnt = 0;
+				ctr->status = SEND_DISABLE;
+			}			
+		break;
+		
+		default:
+		break;
+	}
+} 
+/**@brief Function for handling the Battery measurement timer timeout.
+ *
+ * @details This function will be called each time the battery level measurement timer expires.
+ *
+ * @param[in] p_context  Pointer used for passing some arbitrary information (context) from the
+ *                       app_start_timer() call to the timeout handler.
+ */
+static void uart_rx_ctr_timeout_handler(void * p_context)
+{
+    UNUSED_PARAMETER(p_context);
+    uart_ctr_update(&mRx_ctr);
+}
 /**@brief Function for assert macro callback.
  *
  * @details This function will be called in case of an assert in the SoftDevice.
@@ -139,6 +228,11 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 static void timers_init(void)
 {
     ret_code_t err_code = app_timer_init();
+    APP_ERROR_CHECK(err_code);
+	 // Create timers.
+    err_code = app_timer_create(&m_uart_rx_ctr_timer_id,
+                                APP_TIMER_MODE_REPEATED,
+                                uart_rx_ctr_timeout_handler);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -367,12 +461,18 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
             err_code = nrf_ble_qwr_conn_handle_assign(&m_qwr, m_conn_handle);
             APP_ERROR_CHECK(err_code);
+			mRx_ctr.status = SEND_ENABLE;
+			err_code = app_timer_start(m_uart_rx_ctr_timer_id, UART_RX_CTR_INTERVAL, NULL);
+			APP_ERROR_CHECK(err_code);
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
             NRF_LOG_INFO("Disconnected");
             // LED indication will be changed when advertising starts.
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
+			mRx_ctr.status = SEND_DISABLE;
+			err_code = app_timer_stop(m_uart_rx_ctr_timer_id);
+			APP_ERROR_CHECK(err_code);
             break;
 
         case BLE_GAP_EVT_PHY_UPDATE_REQUEST:
@@ -551,7 +651,7 @@ void uart_event_handle(app_uart_evt_t * p_event)
                         }
                     } while (err_code == NRF_ERROR_RESOURCES);
                 }
-
+				mRx_ctr.status = SEND_DONE;
                 index = 0;
             }
             break;
