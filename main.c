@@ -152,6 +152,7 @@ void uart_ctr_update(rx_ctr_t *ctr)
 		
 		case SEND_DONE:
 		case SEND_ENABLE:
+			uart_tx_okn();
 			ctr->wait_tick_cnt = 0;
 			ctr->status = SEND_OUT_WAIT_RETURN;
 		break;
